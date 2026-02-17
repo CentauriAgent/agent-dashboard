@@ -11,6 +11,80 @@ const GW_TOKEN = '4e8ff197e5ba65c0ef001e3262f3037d76ac5a6d535545e4';
 const JWT_SECRET = crypto.randomBytes(32).toString('hex');
 const JWT_EXPIRY = 24 * 60 * 60; // 24 hours in seconds
 
+// --- Device identity for gateway auth (Ed25519) ---
+const IDENTITY_DIR = path.join(__dirname, '.device-identity');
+const IDENTITY_FILE = path.join(IDENTITY_DIR, 'device.json');
+
+function base64UrlEncode(buf) {
+  return Buffer.from(buf).toString('base64url');
+}
+function base64UrlDecode(str) {
+  return Buffer.from(str, 'base64url');
+}
+
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+function derivePublicKeyRaw(publicKeyPem) {
+  const key = crypto.createPublicKey(publicKeyPem);
+  const spki = key.export({ type: 'spki', format: 'der' });
+  if (spki.length === ED25519_SPKI_PREFIX.length + 32 &&
+      spki.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX)) {
+    return spki.subarray(ED25519_SPKI_PREFIX.length);
+  }
+  return spki;
+}
+
+function fingerprintPublicKey(publicKeyPem) {
+  const raw = derivePublicKeyRaw(publicKeyPem);
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+function loadOrCreateDeviceIdentity() {
+  try {
+    if (fs.existsSync(IDENTITY_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(IDENTITY_FILE, 'utf8'));
+      if (parsed?.version === 1 && parsed.deviceId && parsed.publicKeyPem && parsed.privateKeyPem) {
+        console.log(`Loaded device identity: ${parsed.deviceId.slice(0, 12)}...`);
+        return parsed;
+      }
+    }
+  } catch {}
+  // Generate new identity
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const deviceId = fingerprintPublicKey(publicKeyPem);
+  const identity = { version: 1, deviceId, publicKeyPem, privateKeyPem };
+  fs.mkdirSync(IDENTITY_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(IDENTITY_FILE, JSON.stringify(identity, null, 2) + '\n', { mode: 0o600 });
+  console.log(`Generated new device identity: ${deviceId.slice(0, 12)}...`);
+  return identity;
+}
+
+function buildDeviceAuthPayload(params) {
+  const version = params.nonce ? 'v2' : 'v1';
+  const base = [
+    version,
+    params.deviceId,
+    params.clientId,
+    params.clientMode,
+    params.role,
+    params.scopes.join(','),
+    String(params.signedAtMs),
+    params.token || '',
+  ];
+  if (version === 'v2') base.push(params.nonce || '');
+  return base.join('|');
+}
+
+function signDevicePayload(privateKeyPem, payload) {
+  const key = crypto.createPrivateKey(privateKeyPem);
+  return base64UrlEncode(crypto.sign(null, Buffer.from(payload, 'utf8'), key));
+}
+
+const deviceIdentity = loadOrCreateDeviceIdentity();
+let connectNonce = null; // set from challenge event
+
 // Simple JWT using HMAC
 function createJWT(payload) {
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
@@ -84,17 +158,41 @@ function connectGateway() {
 
       // Handle connect challenge - send connect after receiving it
       if (msg.type === 'event' && msg.event === 'connect.challenge') {
-        console.log('Got challenge, sending connect...');
+        connectNonce = msg.payload?.nonce || null;
+        console.log('Got challenge, sending connect with device auth...');
+        const role = 'operator';
+        const scopes = ['operator.read', 'operator.write', 'operator.admin'];
+        const signedAtMs = Date.now();
+        const nonce = connectNonce || undefined;
+        const authPayload = buildDeviceAuthPayload({
+          deviceId: deviceIdentity.deviceId,
+          clientId: 'gateway-client',
+          clientMode: 'backend',
+          role,
+          scopes,
+          signedAtMs,
+          token: GW_TOKEN,
+          nonce,
+        });
+        const signature = signDevicePayload(deviceIdentity.privateKeyPem, authPayload);
+        const publicKeyRaw = base64UrlEncode(derivePublicKeyRaw(deviceIdentity.publicKeyPem));
         sendReq('connect', {
           minProtocol: 3,
           maxProtocol: 3,
-          client: { id: 'cli', version: '1.0.0', platform: 'linux', mode: 'backend' },
-          role: 'operator',
-          scopes: ['operator.read', 'operator.write', 'operator.admin'],
+          client: { id: 'gateway-client', displayName: 'Agent Dashboard', version: '1.0.0', platform: 'linux', mode: 'backend' },
+          role,
+          scopes,
           caps: [],
           commands: [],
           permissions: {},
           auth: { token: GW_TOKEN },
+          device: {
+            id: deviceIdentity.deviceId,
+            publicKey: publicKeyRaw,
+            signature,
+            signedAt: signedAtMs,
+            nonce,
+          },
           locale: 'en-US',
           userAgent: 'agent-dashboard/1.0.0',
         }).then((res) => {
